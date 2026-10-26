@@ -1,0 +1,565 @@
+openapi: 3.0.3
+info:
+  title: Task Manager API
+  version: 1.0.0
+  description: |
+    REST API для управления задачами внутри команд: ролевая модель (owner / admin / member),
+    история изменений задач, комментарии, кеширование списка задач в Redis и SQL-отчет по команде.
+
+    **Аутентификация:** `POST /api/v1/login` возвращает JWT; передавайте его в заголовке
+    `Authorization: Bearer <token>`.
+
+    **Ошибки** всегда возвращаются в формате `{"error": {"code", "message"}}`.
+    Коды: `validation_error` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404),
+    `conflict` (409), `rate_limited` (429), `internal_error` (500).
+
+    **Видимость:** задачи чужих команд не раскрываются — для них возвращается 404, как для несуществующих.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: auth
+  - name: teams
+  - name: tasks
+  - name: stats
+
+paths:
+  /api/v1/register:
+    post:
+      tags: [auth]
+      summary: Регистрация пользователя
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: Пользователь создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: Email уже занят
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/login:
+    post:
+      tags: [auth]
+      summary: Аутентификация, выдача JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Токен выдан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/teams:
+    post:
+      tags: [teams]
+      summary: Создание команды (текущий пользователь становится owner)
+      description: Команда и членство создателя с ролью owner создаются в одной транзакции.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTeamRequest' }
+      responses:
+        '201':
+          description: Команда создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Team' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      tags: [teams]
+      summary: Команды текущего пользователя
+      responses:
+        '200':
+          description: Список команд, где пользователь состоит (с его ролью)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Team' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/teams/{id}/invite:
+    post:
+      tags: [teams]
+      summary: Добавление пользователя в команду
+      description: |
+        Только owner или admin. Пользователь указывается через `user_id` или `email`.
+        Роль `owner` приглашением не выдается; роль `admin` может выдать только owner.
+      parameters: [ { $ref: '#/components/parameters/TeamID' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InviteRequest' }
+      responses:
+        '201':
+          description: Участник добавлен
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TeamMember' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Пользователь уже в команде
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/teams/{id}/stats:
+    get:
+      tags: [stats]
+      summary: SQL-отчет по команде (только owner или admin)
+      description: |
+        Один CTE-запрос: задачи по статусам, топ-3 исполнителя по закрытым задачам за 30 дней,
+        среднее время закрытия, статистика комментариев. Данные других команд не учитываются.
+      parameters: [ { $ref: '#/components/parameters/TeamID' } ]
+      responses:
+        '200':
+          description: Отчет
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TeamStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/tasks:
+    post:
+      tags: [tasks]
+      summary: Создание задачи
+      description: |
+        Любой участник команды. Создателем становится текущий пользователь. Исполнитель должен
+        состоять в той же команде. Задача и запись истории создаются атомарно.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTaskRequest' }
+      responses:
+        '201':
+          description: Задача создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [tasks]
+      summary: Список задач команды (кешируется в Redis на 5 минут)
+      description: |
+        Требует `team_id` и членства в команде. Сортировка — новые сверху (id DESC).
+        Пагинация: `limit`+`offset` (в ответе есть `total`) или курсорная через `cursor`
+        (значение `next_cursor` из предыдущего ответа; `offset` тогда игнорируется).
+      parameters:
+        - name: team_id
+          in: query
+          required: true
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TaskStatus' }
+        - name: assignee_id
+          in: query
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: cursor
+          in: query
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: Страница задач
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskPage' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/tasks/{id}:
+    parameters: [ { $ref: '#/components/parameters/TaskID' } ]
+    put:
+      tags: [tasks]
+      summary: Обновление задачи
+      description: |
+        Частичное обновление: меняются только переданные поля (`assignee_id: null` снимает исполнителя).
+
+        Права: owner/admin — любые поля; создатель задачи — title, description, status, assignee_id;
+        исполнитель — только status; остальные участники — ничего (403).
+
+        Конкурентность: строка задачи блокируется (`SELECT … FOR UPDATE`), изменения и история
+        считаются от актуального состояния, запись в tasks и task_history — в одной транзакции.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateTaskRequest' }
+      responses:
+        '200':
+          description: Актуальное состояние задачи
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/tasks/{id}/history:
+    get:
+      tags: [tasks]
+      summary: История изменений задачи (участникам команды)
+      parameters:
+        - { $ref: '#/components/parameters/TaskID' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Записи истории в хронологическом порядке
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/HistoryEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/tasks/{id}/comments:
+    parameters: [ { $ref: '#/components/parameters/TaskID' } ]
+    post:
+      tags: [tasks]
+      summary: Добавить комментарий (любой участник команды)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommentRequest' }
+      responses:
+        '201':
+          description: Комментарий добавлен
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Comment' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      tags: [tasks]
+      summary: Комментарии задачи
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Комментарии в хронологическом порядке
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Comment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    TeamID:
+      name: id
+      in: path
+      required: true
+      description: ID команды
+      schema: { type: integer, format: int64, minimum: 1 }
+    TaskID:
+      name: id
+      in: path
+      required: true
+      description: ID задачи
+      schema: { type: integer, format: int64, minimum: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  responses:
+    ValidationError:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: validation_error, message: title is required } }
+    Unauthorized:
+      description: Нет или неверный токен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: unauthorized, message: invalid or expired token } }
+    Forbidden:
+      description: Недостаточно прав
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: forbidden, message: you are not a member of this team } }
+    NotFound:
+      description: Не найдено (или принадлежит чужой команде)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: not_found, message: task not found } }
+    RateLimited:
+      description: Превышен лимит запросов (заголовок Retry-After)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [validation_error, unauthorized, forbidden, not_found, conflict, rate_limited, internal_error]
+            message: { type: string }
+
+    Role:
+      type: string
+      enum: [owner, admin, member]
+    TaskStatus:
+      type: string
+      enum: [todo, in_progress, done]
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email: { type: string, format: email, example: alice@example.com }
+        password: { type: string, minLength: 8, maxLength: 72, description: "8 символов – 72 байта (ограничение bcrypt)", example: s3cret-pass }
+        name: { type: string, maxLength: 255, example: Alice }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, example: alice@example.com }
+        password: { type: string, example: s3cret-pass }
+    LoginResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_at: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+    User:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    CreateTeamRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 255, example: Backend }
+    Team:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        created_by: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+        role: { $ref: '#/components/schemas/Role' }
+    InviteRequest:
+      type: object
+      description: Нужно указать user_id или email.
+      example: { email: bob@example.com, role: member }
+      properties:
+        user_id: { type: integer, format: int64 }
+        email: { type: string, format: email }
+        role:
+          type: string
+          enum: [admin, member]
+          default: member
+    TeamMember:
+      type: object
+      properties:
+        team_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        role: { $ref: '#/components/schemas/Role' }
+        name: { type: string }
+        email: { type: string }
+        joined_at: { type: string, format: date-time }
+
+    CreateTaskRequest:
+      type: object
+      required: [team_id, title]
+      example: { team_id: 1, title: Настроить CI, description: GitHub Actions }
+      properties:
+        team_id: { type: integer, format: int64, example: 1 }
+        title: { type: string, maxLength: 255, example: Настроить CI }
+        description: { type: string, maxLength: 10000 }
+        status:
+          allOf: [ { $ref: '#/components/schemas/TaskStatus' } ]
+          default: todo
+        assignee_id: { type: integer, format: int64, nullable: true }
+    UpdateTaskRequest:
+      type: object
+      description: Все поля необязательны; меняются только переданные.
+      example: { status: in_progress }
+      properties:
+        title: { type: string, maxLength: 255 }
+        description: { type: string, maxLength: 10000 }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        assignee_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: null — снять исполнителя.
+    Task:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        team_id: { type: integer, format: int64 }
+        title: { type: string }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        created_by: { type: integer, format: int64 }
+        assignee_id: { type: integer, format: int64, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        version: { type: integer, format: int64 }
+    TaskPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+        limit: { type: integer }
+        offset: { type: integer }
+        total:
+          type: integer
+          format: int64
+          description: Всего задач по фильтру (только в режиме offset).
+        next_cursor:
+          type: integer
+          format: int64
+          nullable: true
+          description: id последней задачи на странице — передайте его в `cursor`; null — страниц больше нет.
+
+    HistoryEntry:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        changed_by: { type: integer, format: int64 }
+        changes:
+          type: object
+          description: Поле → {old, new}. При создании задачи old = null.
+          additionalProperties:
+            type: object
+            properties:
+              old: { nullable: true }
+              new: { nullable: true }
+          example:
+            status: { old: in_progress, new: done }
+            closed_at: { old: null, new: "2026-10-26T10:00:00.000Z" }
+        created_at: { type: string, format: date-time }
+    CommentRequest:
+      type: object
+      required: [content]
+      properties:
+        content: { type: string, maxLength: 5000 }
+    Comment:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        task_id: { type: integer, format: int64 }
+        user_id: { type: integer, format: int64 }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+
+    TeamStats:
+      type: object
+      properties:
+        team_id: { type: integer, format: int64 }
+        tasks_by_status:
+          type: object
+          properties:
+            todo: { type: integer }
+            in_progress: { type: integer }
+            done: { type: integer }
+        total_tasks: { type: integer }
+        top_assignees_30d:
+          type: array
+          maxItems: 3
+          items:
+            type: object
+            properties:
+              user_id: { type: integer, format: int64 }
+              name: { type: string }
+              email: { type: string }
+              closed_tasks: { type: integer }
+        closed_tasks_total: { type: integer }
+        avg_close_time_seconds:
+          type: number
+          nullable: true
+          description: Среднее (closed_at − created_at) по закрытым задачам; null, если закрытых нет.
+        comments:
+          type: object
+          properties:
+            total: { type: integer }
+            tasks_with_comments: { type: integer }
+            avg_per_task: { type: number }
+        generated_at: { type: string, format: date-time }
